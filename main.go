@@ -117,10 +117,10 @@ func (js *jsifier) handleFunc() error {
 	return js.jsifyFuncDecl(js.decl)
 }
 
-func (js *jsifier) jsifyFuncDecl(node *ast.FuncDecl) error {
-	js.write("function " + node.Name.Name + "(")
+func (js *jsifier) jsifyFuncType(node *ast.FuncType) error {
+	js.write("(")
 
-	list := node.Type.Params
+	list := node.Params
 	if list == nil {
 		return nil
 	}
@@ -136,6 +136,15 @@ func (js *jsifier) jsifyFuncDecl(node *ast.FuncDecl) error {
 	}
 
 	js.write(")")
+	return nil
+}
+
+func (js *jsifier) jsifyFuncDecl(node *ast.FuncDecl) error {
+	js.write("function " + node.Name.Name)
+
+	if err := js.jsifyFuncType(node.Type); err != nil {
+		return fmt.Errorf("jsify func type: %w", err)
+	}
 
 	if node.Body != nil {
 		return js.jsifyStmt(node.Body)
@@ -210,17 +219,107 @@ func (js *jsifier) jsifyAssignStmt(node *ast.AssignStmt) error {
 		js.write("let ")
 	}
 
-	js.write("[")
+	multiAssign := len(node.Lhs) > 1
+	isCommaOk := len(node.Lhs) != len(node.Rhs) && len(node.Rhs) == 1
+
+	var starLhs []*ast.StarExpr
+	var withStarRhs []ast.Expr
+	var noStartExprIds []int
 	for i, expr := range node.Lhs {
+		if starExpr, ok := expr.(*ast.StarExpr); ok {
+			starLhs = append(starLhs, starExpr)
+			withStarRhs = append(withStarRhs, node.Rhs[i])
+			continue
+		}
+
+		noStartExprIds = append(noStartExprIds, i)
+	}
+
+	if len(starLhs) > 0 {
+		if multiAssign {
+			js.write("(")
+		}
+
+		for i := 0; i < len(starLhs); i++ {
+			l, r := starLhs[i], withStarRhs[i]
+			if err := js.jsifyExpr(l.X); err != nil {
+				return fmt.Errorf("jsify left expr: %w", err)
+			}
+
+			js.write(".store(")
+
+			if node.Tok != token.ASSIGN {
+				if err := js.jsifyStarExpr(l); err != nil {
+					return fmt.Errorf("jsify star expr: %w", err)
+				}
+			}
+
+			switch node.Tok {
+			case token.ADD_ASSIGN:
+				js.write("+")
+			case token.SUB_ASSIGN:
+				js.write("-")
+			case token.MUL_ASSIGN:
+				js.write("*")
+			case token.QUO_ASSIGN:
+				js.write("/")
+			case token.REM_ASSIGN:
+				js.write("%")
+			case token.AND_ASSIGN:
+				js.write("&")
+			case token.OR_ASSIGN:
+				js.write("|")
+			case token.XOR_ASSIGN:
+				js.write("^")
+			case token.SHL_ASSIGN:
+				js.write("<<")
+			case token.SHR_ASSIGN:
+				js.write(">>")
+			case token.AND_NOT_ASSIGN:
+				return errors.New("and not assign (&^=) not supported")
+			}
+
+			if err := js.jsifyExpr(r); err != nil {
+				return fmt.Errorf("jsify right expr: %w", err)
+			}
+
+			js.write(")")
+
+			if i != len(starLhs)-1 {
+				js.write(", ")
+			}
+		}
+
+		if multiAssign {
+			js.write(")")
+		}
+	}
+
+	if len(noStartExprIds) == 0 {
+		return nil
+	} else if len(noStartExprIds) < len(node.Lhs) {
+		js.write(";\n")
+	}
+
+	if multiAssign {
+		js.write("[")
+	}
+
+	for i, idx := range noStartExprIds {
+		expr := node.Lhs[idx]
 		if err := js.jsifyExpr(expr); err != nil {
 			return fmt.Errorf("jsify expr: %w", err)
 		}
-		if i != len(node.Lhs)-1 {
+		if i != len(noStartExprIds)-1 {
 			js.write(", ")
 		}
 	}
 
-	js.write("] ")
+	if multiAssign {
+		js.write("]")
+	}
+
+	js.write(" ")
 
 	switch node.Tok {
 	case token.DEFINE, token.ASSIGN:
@@ -252,18 +351,36 @@ func (js *jsifier) jsifyAssignStmt(node *ast.AssignStmt) error {
 		panic("unreachable")
 	}
 
-	js.write(" [")
+	js.write(" ")
 
-	for i, expr := range node.Rhs {
+	if isCommaOk {
+		js.write("Object.values(go.typeAssert(")
+
+		if err := js.jsifyExpr(node.Rhs[0]); err != nil {
+			return fmt.Errorf("jsify expr: %w", err)
+		}
+
+		js.write("))")
+		return nil
+	}
+
+	if multiAssign {
+		js.write("[")
+	}
+
+	for i, idx := range noStartExprIds {
+		expr := node.Rhs[idx]
 		if err := js.jsifyExpr(expr); err != nil {
 			return fmt.Errorf("jsify expr: %w", err)
 		}
-		if i != len(node.Lhs)-1 {
+		if i != len(noStartExprIds)-1 {
 			js.write(", ")
 		}
 	}
 
-	js.write("]")
+	if multiAssign {
+		js.write("]")
+	}
 	return nil
 }
 
@@ -443,39 +560,243 @@ func (js *jsifier) jsifyExpr(node ast.Expr) error {
 	case *ast.BasicLit:
 		return js.jsifyBasicLit(node)
 	case *ast.FuncLit:
-		panic("not implemented")
+		return js.jsifyFuncLit(node)
 	case *ast.CompositeLit:
-		panic("not implemented")
+		return js.jsifyCompositeLit(node)
 	case *ast.ParenExpr:
-		panic("not implemented")
+		return js.jsifyParenExpr(node)
 	case *ast.SelectorExpr:
-		panic("not implemented")
+		return js.jsifySelectorExpr(node)
 	case *ast.IndexExpr:
-		panic("not implemented")
+		return js.jsifyIndexExpr(node)
 	case *ast.IndexListExpr:
-		panic("not implemented")
+		// for type parameters, skip
+		return nil
 	case *ast.SliceExpr:
-		panic("not implemented")
+		return js.jsifySliceExpr(node)
 	case *ast.TypeAssertExpr:
-		panic("not implemented")
+		typAndVal := js.pkg.TypesInfo.Types[node.Type]
+		if !typAndVal.HasOk() {
+			return nil
+		}
+
+		typ := typAndVal.Type.(*types.Named)
+		switch typ := typ.Underlying().(type) {
+		case *types.Interface:
+			if typ.NumMethods() == 0 {
+				// simple case
+				return nil
+			}
+		case *types.Struct:
+
+		}
+		return nil
 	case *ast.CallExpr:
-		panic("not implemented")
+		// panic("not implemented")
+		js.write("<call expr>")
+		return nil
 	case *ast.StarExpr:
-		panic("not implemented")
+		return js.jsifyStarExpr(node)
 	case *ast.UnaryExpr:
-		panic("not implemented")
+		return js.jsifyUnaryExpr(node)
 	case *ast.BinaryExpr:
-		panic("not implemented")
+		return js.jsifyBinaryExpr(node)
 	case *ast.KeyValueExpr:
-		panic("not implemented")
+		return js.jsifyKeyValueExpr(node)
 	}
 
 	js.write("<unk>")
-	return fmt.Errorf("unknown expr on %s", js.pkg.Fset.Position(node.Pos()))
+	return fmt.Errorf("unknown expr %T on %s", node, js.pkg.Fset.Position(node.Pos()))
 }
 
 func (js *jsifier) jsifyIdent(node *ast.Ident) error {
 	js.buf.WriteString(node.Name)
+	return nil
+}
+
+func (js *jsifier) jsifySliceExpr(node *ast.SliceExpr) error {
+	js.write("go.slice(")
+
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write(", ")
+
+	if node.Low != nil {
+		if err := js.jsifyExpr(node.Low); err != nil {
+			return fmt.Errorf("jsify expr: %w", err)
+		}
+	} else {
+		js.write("undefined")
+	}
+
+	js.write(", ")
+
+	if node.High != nil {
+		if err := js.jsifyExpr(node.High); err != nil {
+			return fmt.Errorf("jsify expr: %w", err)
+		}
+	} else {
+		js.write("undefined")
+	}
+
+	js.write(", ")
+
+	if node.Max != nil {
+		if err := js.jsifyExpr(node.Max); err != nil {
+			return fmt.Errorf("jsify expr: %w", err)
+		}
+	} else {
+		js.write("undefined")
+	}
+
+	js.write(")")
+	return nil
+}
+
+func (js *jsifier) jsifyIndexExpr(node *ast.IndexExpr) error {
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write("[")
+
+	if err := js.jsifyExpr(node.Index); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write("]")
+	return nil
+}
+
+func (js *jsifier) jsifySelectorExpr(node *ast.SelectorExpr) error {
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write(".")
+	js.buf.WriteString(node.Sel.Name)
+	return nil
+}
+
+func (js *jsifier) jsifyParenExpr(node *ast.ParenExpr) error {
+	js.write("(")
+
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write(")")
+
+	return nil
+}
+
+func (js *jsifier) jsifyKeyValueExpr(node *ast.KeyValueExpr) error {
+	if err := js.jsifyExpr(node.Key); err != nil {
+		return fmt.Errorf("jsify key expr: %w", err)
+	}
+
+	js.write(": ")
+
+	if err := js.jsifyExpr(node.Value); err != nil {
+		return fmt.Errorf("jsify value expr: %w", err)
+	}
+
+	return nil
+}
+
+func (js *jsifier) jsifyCompositeLit(node *ast.CompositeLit) error {
+	typAndVal := js.pkg.TypesInfo.Types[node]
+	_, isArray := typAndVal.Type.(*types.Array)
+	if !isArray {
+		_, isArray = typAndVal.Type.(*types.Slice)
+	}
+
+	if isArray {
+		js.write("Array(")
+	} else {
+		js.write("Object.create({")
+	}
+
+	if len(node.Elts) != 0 {
+		js.write("\n")
+	}
+
+	for _, elt := range node.Elts {
+		if err := js.jsifyExpr(elt); err != nil {
+			return fmt.Errorf("jsify expr: %w", err)
+		}
+		js.write(",\n")
+	}
+
+	if isArray {
+		js.write(")")
+	} else {
+		js.write("})")
+	}
+	return nil
+}
+
+func (js *jsifier) jsifyFuncLit(node *ast.FuncLit) error {
+	if err := js.jsifyFuncType(node.Type); err != nil {
+		return fmt.Errorf("jsify func type: %w", err)
+	}
+
+	if err := js.jsifyBlockStmt(node.Body); err != nil {
+		return fmt.Errorf("jsify block stmt: %w", err)
+	}
+
+	return nil
+}
+
+func (js *jsifier) jsifyStarExpr(node *ast.StarExpr) error {
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write(".unref()")
+	return nil
+}
+
+func (js *jsifier) jsifyUnaryExpr(node *ast.UnaryExpr) error {
+	switch node.Op {
+	case token.ADD, token.SUB, token.NOT, token.XOR, token.MUL, token.AND:
+	case token.ARROW:
+		return errors.New("arrow operator not implemented")
+	default:
+		return fmt.Errorf("operator %s not supported", node.Op)
+	}
+
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+	return nil
+}
+
+func (js *jsifier) jsifyBinaryExpr(node *ast.BinaryExpr) error {
+	if err := js.jsifyExpr(node.X); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
+	js.write(" ")
+
+	switch node.Op {
+	case token.LOR, token.LAND,
+		token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ,
+		token.ADD, token.SUB, token.OR, token.XOR,
+		token.MUL, token.QUO, token.REM, token.SHL, token.SHR, token.AND:
+		js.write(node.Op.String())
+	default:
+		return fmt.Errorf("operator %s not supported", node.Op)
+	}
+
+	js.write(" ")
+
+	if err := js.jsifyExpr(node.Y); err != nil {
+		return fmt.Errorf("jsify expr: %w", err)
+	}
+
 	return nil
 }
 
